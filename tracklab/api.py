@@ -9,7 +9,8 @@ import cv2
 import hydra
 from hydra import compose, initialize
 import torch
-from fastapi import FastAPI, UploadFile, File
+from fastapi import FastAPI, UploadFile, File, Request
+from fastapi.exceptions import HTTPException
 from hydra.utils import instantiate
 from omegaconf import OmegaConf
 
@@ -129,7 +130,7 @@ async def test_endpoint():
     return {"status": "ok", "message": "API is running"}
 
 @app.post("/invoke")
-async def process_video(video: UploadFile = File(...)):
+async def process_video(request: Request, video: UploadFile = File(...)):
     """Process a video file and return tracking results"""
     
     if not video.filename.endswith('.mp4'):
@@ -152,6 +153,15 @@ async def process_video(video: UploadFile = File(...)):
         fps = 6
         frame_interval = int(cap.get(cv2.CAP_PROP_FPS) / fps)
         while True:
+            # Check if client is still connected
+            if await request.is_disconnected():
+                cap.release()
+                # Clean up frames if client disconnected
+                for frame_file in frames_dir.glob("*.jpg"):
+                    frame_file.unlink()
+                raise HTTPException(status_code=499, 
+                                   detail="Client disconnected")
+                
             ret, frame = cap.read()
             if not ret:
                 break
@@ -160,6 +170,7 @@ async def process_video(video: UploadFile = File(...)):
             frame_count += 1
         cap.release()
         
+        log.info("Initializing tracker state")
         # Initialize tracker state
         tracking_set = tracking_dataset.sets[cfg.dataset.eval_set]
         tracker_state = TrackerState(
@@ -167,18 +178,36 @@ async def process_video(video: UploadFile = File(...)):
             pipeline=pipeline,
             **cfg.state
         )
+        log.info("Tracker state initialized")
         
         # Run tracking
+        log.info("Initializing tracking engine")
         tracking_engine = instantiate(
             cfg.engine,
             modules=pipeline,
             tracker_state=tracker_state,
         )
-        tracking_engine.track_dataset()
+        log.info("Tracking engine initialized")
+        
+        # Check for client disconnection before running tracking
+        if await request.is_disconnected():
+            # Clean up frames if client disconnected
+            for frame_file in frames_dir.glob("*.jpg"):
+                frame_file.unlink()
+            raise HTTPException(status_code=499, 
+                               detail="Client disconnected")
+                
+        log.info("Running tracking")
+        tracking_engine.video_loop()
+        log.info("Tracking completed")
         
         # Save visualization video
         output_dir = Path("outputs/videos")
         output_dir.mkdir(parents=True, exist_ok=True)
+        
+        # Clean up frames
+        for frame_file in frames_dir.glob("*.jpg"):
+            frame_file.unlink()
         
         # Return results
         return {
